@@ -3,9 +3,12 @@
 /// Rewards are accumulated in persistent storage keyed by (role, address, token).
 /// The contract admin calls `accrue_reward` to credit a user; users call `claim_reward`
 /// to transfer the full accrued balance to themselves.
+///
+/// All arithmetic on balance fields uses Rust's `checked_add` / `checked_sub` to
+/// produce named `ContractError` variants on overflow/underflow (CT-022).
 use soroban_sdk::{contractevent, contractimpl, panic_with_error, symbol_short, token, Address, Env, Symbol};
 
-use crate::{ContractError, KovaraContract, RewardRole, StorageKey};
+use crate::{ContractError, KovaraContract, RewardAssetConfig, RewardRole, StorageKey};
 
 // ── Events ────────────────────────────────────────────────────────────────────
 
@@ -29,7 +32,35 @@ pub struct RewardClaimedEvent {
     pub amount: i128,
 }
 
-// ── impl ──────────────────────────────────────────────────────────────────────
+#[contractevent]
+#[derive(Clone)]
+pub struct RewardFundsDepositedEvent {
+    #[topic]
+    pub depositor: Address,
+    #[topic]
+    pub token: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct RewardFundsRecoveredEvent {
+    #[topic]
+    pub recipient: Address,
+    #[topic]
+    pub token: Address,
+    pub amount: i128,
+}
+
+#[contracterror]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoteError {
+    AlreadyVoted = 0,
+}
+
+#[contractimpl]
+impl KovaraContract {
+// ── Implementation ────────────────────────────────────────────────────────────
 
 #[contractimpl]
 impl KovaraContract {
@@ -41,9 +72,13 @@ impl KovaraContract {
     /// is simply incremented. The actual transfer happens when the recipient
     /// calls [`claim_reward`].
     ///
+    /// CT-022: uses `checked_add` so overflow produces `PoolBalanceOverflow`
+    /// instead of a generic host trap.
+    ///
     /// # Panics
-    /// - `NotInitialized` – contract not yet initialized.
-    /// - `MustBePositive` – `amount <= 0`.
+    /// - `NotInitialized` — contract not yet initialized.
+    /// - `MustBePositive` — `amount <= 0`.
+    /// - `PoolBalanceOverflow` — accrued balance would overflow `i128`.
     pub fn accrue_reward(
         env: Env,
         role: RewardRole,
@@ -52,6 +87,7 @@ impl KovaraContract {
         amount: i128,
     ) {
         Self::require_initialized(&env);
+        Self::require_not_paused(&env);
         Self::bump_instance(&env);
         Self::require_admin(&env);
 
@@ -61,16 +97,23 @@ impl KovaraContract {
 
         let key = StorageKey::RewardBalance(role.clone(), recipient.clone(), token.clone());
         let current: i128 = env.storage().persistent().get(&key).unwrap_or(0i128);
-        let new_balance = current.checked_add(amount).unwrap_or_else(|| {
-            panic_with_error!(&env, ContractError::PoolBalanceOverflow);
-        });
+
+        // CT-022: checked_add — overflow produces a named contract error.
+        let new_balance = current
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PoolBalanceOverflow));
+
         env.storage().persistent().set(&key, &new_balance);
         Self::bump(&env, &key);
+        Self::increase_liability(&env, &token, amount);
+
+        Self::increase_liability(&env, &token, amount);
 
         let role_sym = match role {
-            RewardRole::Submitter => symbol_short!("submitr"),
-            RewardRole::Verifier => symbol_short!("verifir"),
+            RewardRole::Submitter => symbol_short!("submitter"),
+            RewardRole::Verifier => symbol_short!("verifier"),
         };
+
         RewardAccruedEvent {
             role: role_sym,
             recipient,
@@ -80,6 +123,114 @@ impl KovaraContract {
         .publish(&env);
     }
 
+    /// Deposit reward assets into the contract so there are funds available
+    /// when users call `claim_reward`. Admin-only; the depositor must authorize
+    /// the transfer.
+    pub fn fund_rewards(env: Env, depositor: Address, token: Address, amount: i128) {
+        Self::require_initialized(&env);
+        Self::require_not_paused(&env);
+        Self::bump_instance(&env);
+        Self::require_admin(&env);
+        depositor.require_auth();
+
+        Self::validate_reward_asset(&env, &token);
+
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::MustBePositive);
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &depositor,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        RewardFundsDepositedEvent {
+            depositor,
+            token,
+            amount,
+        }
+        .publish(&env);
+    }
+
+    /// Recover only surplus reward assets. The admin cannot withdraw assets
+    /// reserved by outstanding reward liabilities.
+    ///
+    /// CT-022: uses `checked_sub` on the surplus calculation so an underflow
+    /// (liability > on-chain balance) produces `RewardFundsUnavailable`.
+    pub fn recover_rewards(env: Env, recipient: Address, token: Address, amount: i128) {
+        Self::require_initialized(&env);
+        Self::require_not_paused(&env);
+        Self::bump_instance(&env);
+        Self::require_admin(&env);
+
+        Self::validate_reward_asset(&env, &token);
+
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::MustBePositive);
+        }
+
+        let available = token::Client::new(&env, &token).balance(&env.current_contract_address())
+            - Self::get_reward_liability_internal(&env, &token);
+        let token_client = token::Client::new(&env, &token);
+        let balance = token_client.balance(&env.current_contract_address());
+        let liability = Self::get_reward_liability_internal(&env, &token);
+
+        // CT-022: checked_sub — if liability > balance the subtraction underflows;
+        // treat that as RewardFundsUnavailable.
+        let available = balance
+            .checked_sub(liability)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::RewardFundsUnavailable));
+
+        if amount > available {
+            panic_with_error!(&env, ContractError::RewardFundsReserved);
+        }
+
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+
+        RewardFundsRecoveredEvent {
+            recipient,
+            token,
+            amount,
+        }
+        .publish(&env);
+    }
+
+    pub fn set_supported_reward_assets(env: Env, xlm: Address, usdc: Address) {
+        Self::require_initialized(&env);
+        Self::require_admin(&env);
+
+        env.storage().persistent().set(
+            &StorageKey::RewardAssets,
+            &RewardAssetConfig { xlm, usdc },
+        );
+        Self::bump(&env, &StorageKey::RewardAssets);
+    }
+
+    pub fn get_supported_reward_assets(env: Env) -> Option<RewardAssetConfig> {
+        Self::require_initialized(&env);
+        let config: Option<RewardAssetConfig> = env.storage().persistent().get(&StorageKey::RewardAssets);
+        if config.is_some() {
+            Self::bump(&env, &StorageKey::RewardAssets);
+        }
+        config
+    }
+
+    pub fn get_reward_liability(env: Env, token: Address) -> i128 {
+        Self::require_initialized(&env);
+        Self::get_reward_liability_internal(&env, &token)
+    }
+
+    pub fn get_reward_balance(
+        env: Env,
+        role: RewardRole,
+        user: Address,
+        token: Address,
+    ) -> i128 {
     // ── Reward query ──────────────────────────────────────────────────────────
 
     /// Return the unclaimed reward balance for `user` under `role` for `token`.
@@ -100,15 +251,22 @@ impl KovaraContract {
     /// reset the on-chain balance to `0`.
     ///
     /// The balance is zeroed *before* the token transfer to guard against
-    /// re-entrant double-spend.
+    /// re-entrant double-spend (check-effects-interactions pattern).
+    ///
+    /// CT-022: `decrease_liability` uses `checked_sub` so any accounting
+    /// inconsistency surfaces as `PoolBalanceUnderflow` rather than wrapping.
     ///
     /// # Panics
-    /// - `NotInitialized` – contract not yet initialized.
-    /// - `LowBalance` – caller has no accrued balance for this role/token.
+    /// - `NotInitialized` — contract not yet initialized.
+    /// - `LowBalance` — caller has no accrued balance for this role/token.
+    /// - `RewardFundsUnavailable` — contract holds insufficient tokens to pay.
     pub fn claim_reward(env: Env, claimant: Address, role: RewardRole, token: Address) {
         Self::require_initialized(&env);
+        Self::require_not_paused(&env);
         Self::bump_instance(&env);
         claimant.require_auth();
+
+        Self::validate_reward_asset(&env, &token);
 
         let key = StorageKey::RewardBalance(role, claimant.clone(), token.clone());
         let balance: i128 = env.storage().persistent().get(&key).unwrap_or(0i128);
@@ -116,15 +274,17 @@ impl KovaraContract {
             panic_with_error!(&env, ContractError::LowBalance);
         }
 
-        // Zero out before transferring (re-entrancy guard).
+        let token_client = token::Client::new(&env, &token);
+        if token_client.balance(&env.current_contract_address()) < balance {
+            panic_with_error!(&env, ContractError::RewardFundsUnavailable);
+        }
+
+        // Zero out before transferring (re-entrancy guard / check-effects-interactions).
         env.storage().persistent().set(&key, &0i128);
         Self::bump(&env, &key);
+        Self::decrease_liability(&env, &token, balance);
 
-        token::Client::new(&env, &token).transfer(
-            &env.current_contract_address(),
-            &claimant,
-            &balance,
-        );
+        token_client.transfer(&env.current_contract_address(), &claimant, &balance);
 
         RewardClaimedEvent {
             claimant,
@@ -132,5 +292,76 @@ impl KovaraContract {
             amount: balance,
         }
         .publish(&env);
+    }
+
+    pub fn vote(env: Env, submission_id: u64, verifier: Address, vote: bool) {
+        Self::require_initialized(&env);
+        Self::bump_instance(&env);
+        verifier.require_auth();
+
+        let key = StorageKey::HasVoted(submission_id, verifier.clone());
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, VoteError::AlreadyVoted);
+        }
+
+        env.storage().persistent().set(&key, &vote);
+        Self::bump(&env, &key);
+    }
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    fn validate_reward_asset(env: &Env, token: &Address) {
+        if *token == env.current_contract_address() {
+            panic_with_error!(env, ContractError::InvalidRewardAsset);
+        }
+
+        if let Some(config) = env
+            .storage()
+            .persistent()
+            .get::<_, RewardAssetConfig>(&StorageKey::RewardAssets)
+        {
+            let matches_supported = *token == config.xlm || *token == config.usdc;
+            if !matches_supported {
+                panic_with_error!(env, ContractError::InvalidRewardAsset);
+            }
+        }
+
+        // Verify the token is a valid SEP-41 asset by calling balance().
+        token::Client::new(env, token).balance(&env.current_contract_address());
+    }
+
+    fn get_reward_liability_internal(env: &Env, token: &Address) -> i128 {
+        let key = StorageKey::RewardLiability(token.clone());
+        let value: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if value > 0 {
+            Self::bump(env, &key);
+        }
+        value
+    }
+
+    /// Increase the total outstanding reward liability for `token` by `amount`.
+    ///
+    /// CT-022: uses `checked_add` — overflow produces `PoolBalanceOverflow`.
+    fn increase_liability(env: &Env, token: &Address, amount: i128) {
+        let key = StorageKey::RewardLiability(token.clone());
+        let current = Self::get_reward_liability_internal(env, token);
+        let value = current
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::PoolBalanceOverflow));
+        env.storage().persistent().set(&key, &value);
+        Self::bump(env, &key);
+    }
+
+    /// Decrease the total outstanding reward liability for `token` by `amount`.
+    ///
+    /// CT-022: uses `checked_sub` — underflow (liability < amount, meaning
+    /// accounting is inconsistent) produces `PoolBalanceUnderflow`.
+    fn decrease_liability(env: &Env, token: &Address, amount: i128) {
+        let key = StorageKey::RewardLiability(token.clone());
+        let current = Self::get_reward_liability_internal(env, token);
+        let value = current
+            .checked_sub(amount)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::PoolBalanceUnderflow));
+        env.storage().persistent().set(&key, &value);
+        Self::bump(env, &key);
     }
 }

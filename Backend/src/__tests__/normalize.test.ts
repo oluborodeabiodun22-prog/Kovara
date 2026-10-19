@@ -1,0 +1,89 @@
+import { normalizeAddress, normalizeAmount, normalizeLedger, normalizeEvent } from "../normalize";
+
+const ADDRESS = `G${"A".repeat(55)}`;
+
+describe("price and event normalization (#667)", () => {
+  it("trims, validates, and preserves valid Stellar addresses", () => {
+    expect(normalizeAddress(` ${ADDRESS} `)).toBe(ADDRESS);
+    expect(() => normalizeAddress(" ")).toThrow(/empty/);
+    expect(() => normalizeAddress("G123")).toThrow(/56 characters/);
+    expect(() => normalizeAddress(`S${"A".repeat(55)}`)).toThrow(/valid Stellar public key/);
+    expect(() => normalizeAddress(`G${"0".repeat(55)}`)).toThrow(/valid Stellar public key/);
+  });
+
+  it("normalizes integer prices without losing large integer precision", () => {
+    expect(normalizeAmount(" +000900719925474099312345 ")).toBe("900719925474099312345");
+    expect(normalizeAmount(-12.9)).toBe("-12");
+    expect(normalizeAmount(12n)).toBe("12");
+    for (const invalid of ["", "1.2", "NaN", "Infinity"]) {
+      expect(() => normalizeAmount(invalid)).toThrow();
+    }
+    expect(() => normalizeAmount(Number.POSITIVE_INFINITY)).toThrow(/non-finite/);
+  });
+
+  it("accepts positive integer ledgers only", () => {
+    expect(normalizeLedger(1)).toBe(1);
+    for (const invalid of [0, -1, 1.2, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(() => normalizeLedger(invalid)).toThrow(/positive integer/);
+    }
+  });
+
+  it("applies only requested fields and returns a fresh deterministic object", () => {
+    const event = { address: ` ${ADDRESS} `, amount: "+0008", untouched: " x " };
+    const schema = {
+      address: (value: unknown) => normalizeAddress(value as string),
+      amount: (value: unknown) => normalizeAmount(value as string | number | bigint),
+    };
+    const normalized = normalizeEvent(event, schema);
+    expect(normalized).toEqual({ address: ADDRESS, amount: "8", untouched: " x " });
+    expect(event.address).toBe(` ${ADDRESS} `);
+    expect(normalizeEvent(event, schema)).toEqual(normalized);
+  });
+});
+
+/**
+ * Canonical address representation (BE-08).
+ *
+ * A Stellar strkey is base-32 over `A–Z` and `2–7`, so upper-case is the
+ * canonical encoding. Folding case means a profile created from `gabc…` is
+ * found again by a lookup for `GABC…` instead of silently producing a second
+ * row for the same account.
+ */
+describe("address casing normalization (BE-08)", () => {
+  it("returns the same canonical string for every casing of one account", () => {
+    const lower = ADDRESS.toLowerCase();
+    const mixed = `g${ADDRESS.slice(1, 30).toLowerCase()}${ADDRESS.slice(30)}`;
+
+    expect(normalizeAddress(ADDRESS)).toBe(ADDRESS);
+    expect(normalizeAddress(lower)).toBe(ADDRESS);
+    expect(normalizeAddress(mixed)).toBe(ADDRESS);
+    expect(normalizeAddress(` ${lower} `)).toBe(ADDRESS);
+  });
+
+  it("is idempotent, so a second normalization changes nothing", () => {
+    const once = normalizeAddress(ADDRESS.toLowerCase());
+    expect(normalizeAddress(once)).toBe(once);
+  });
+
+  it("still rejects characters outside the strkey alphabet after folding", () => {
+    // Case-insensitivity must not weaken the alphabet check: `0`/`1`/`8`/`9`
+    // are not strkey characters in either case.
+    expect(() => normalizeAddress(`G${"0".repeat(55)}`)).toThrow(/valid Stellar public key/);
+    expect(() => normalizeAddress(`g${"0".repeat(55)}`)).toThrow(/valid Stellar public key/);
+    expect(() => normalizeAddress(`g${"1".repeat(55)}`)).toThrow(/valid Stellar public key/);
+  });
+
+  it("still rejects a non-G prefix in lower case", () => {
+    expect(() => normalizeAddress(`s${"a".repeat(55)}`)).toThrow(/valid Stellar public key/);
+  });
+
+  it("reports the length error before the alphabet error for a short value", () => {
+    expect(() => normalizeAddress("gabc")).toThrow(/56 characters/);
+  });
+
+  it("normalizes the address inside a normalized event", () => {
+    const event = { user: ADDRESS.toLowerCase(), untouched: ADDRESS.toLowerCase() };
+    const normalized = normalizeEvent(event, { user: normalizeAddress });
+    expect(normalized).toEqual({ user: ADDRESS, untouched: ADDRESS.toLowerCase() });
+  });
+});

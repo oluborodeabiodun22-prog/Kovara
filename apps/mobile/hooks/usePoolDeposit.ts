@@ -150,6 +150,10 @@ export function usePoolDeposit(): UsePoolDepositReturn {
 
   const deposit = useCallback(
     async (poolId: string, amount: string, token: string) => {
+      if (pending) {
+        return;
+      }
+
       setPending(true);
       setError(null);
       setSuccess(false);
@@ -160,12 +164,16 @@ export function usePoolDeposit(): UsePoolDepositReturn {
           throw new Error("Connect your wallet to deposit into this pool.");
         }
 
-        if (!amount || parseFloat(amount) <= 0) {
-          throw new Error("Amount must be greater than zero");
+        // Validate amount precision, zero, and negative values before touching wallet
+        const parseResult = parseAmountToUnits(amount, DEFAULT_TOKEN_DECIMALS);
+        if (!parseResult.ok) {
+          throw new Error(parseResult.error);
         }
 
-        if (!token) {
-          throw new Error("Token is required");
+        // Verify pool and token before wallet interaction
+        const validationResult = await validatePoolAndToken(poolId, token);
+        if (!validationResult.ok) {
+          throw new Error(validationResult.error);
         }
 
         const walletKit = globalThis.__Kovara_WALLET_KIT__;
@@ -173,15 +181,7 @@ export function usePoolDeposit(): UsePoolDepositReturn {
           throw new Error("Wallet not initialized. Please reconnect.");
         }
 
-        // Convert human amount to smallest unit (7 decimals for Stellar assets by default).
-        const decimals = 7;
-        const amountBigInt = BigInt(
-          Math.floor(parseFloat(amount) * Math.pow(10, decimals))
-        );
-
-        if (amountBigInt <= 0n) {
-          throw new Error("Amount must be greater than zero");
-        }
+        const amountBigInt = BigInt(parseResult.units);
 
         const result = await sdkPoolDeposit(
           contractId,
@@ -204,7 +204,7 @@ export function usePoolDeposit(): UsePoolDepositReturn {
         setPending(false);
       }
     },
-    [address, connected, contractId, rpcUrl]
+    [address, connected, contractId, rpcUrl, pending]
   );
 
   const reset = useCallback(() => {
@@ -222,4 +222,4 @@ export function usePoolDeposit(): UsePoolDepositReturn {
     deposit,
     reset,
   };
-}
+  }

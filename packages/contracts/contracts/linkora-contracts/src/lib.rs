@@ -26,8 +26,19 @@ pub enum StorageKey {
     Blocks(Address),           // persistent: blocker -> Map<Address, ()>
     UsernameIndex(String), // persistent: username -> owner Address (reverse index for uniqueness)
     TipCooldown(u64, Address), // temporary: (post_id, tipper) -> last-tip ledger sequence number
+    PriceObservation(Address, String, u64), // persistent: contributor/item/period -> observation
+    PriceRate(Address), // persistent: contributor -> last submission ledger
+    PriceStake(Address), // persistent: contributor -> locked stake
     Proposal(u64),              // persistent: proposal_id -> Proposal
     RewardBalance(RewardRole, Address, Address), // persistent: (role, user, token) -> i128
+    RewardLiability(Address),  // persistent: token -> total unclaimed rewards
+    RewardAssets,              // persistent: configured XLM + USDC reward asset addresses
+    Admin,                     // persistent or instance admin reference
+    Verifier(Address),          // persistent: registered verifier marker
+    VerifierStake(Address, Address), // persistent: (verifier, token) -> i128
+    VoteRound(u64),                  // persistent: submission_id -> VoteRound
+    HasVoted(u64, Address),          // persistent: (submission_id, verifier) -> bool
+    QuorumConfig,                    // instance: quorum configuration parameters
 }
 
 // ── Error Codes ────────────────────────────────────────────────────────────────
@@ -35,6 +46,7 @@ pub enum StorageKey {
 #[contracterror]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContractError {
+    // ── Core / initialization ─────────────────────────────────────────────────
     AlreadyInitialized = 1,
     InvalidFee = 2,
     InvalidUsername = 3,
@@ -68,8 +80,10 @@ pub enum ContractError {
     TreasuryNotSet = 31,
     FeeCalculationOverflow = 32,
     TipTotalOverflow = 33,
+    // ── Pool balance (CT-022) ─────────────────────────────────────────────────
     PoolBalanceOverflow = 34,
     PoolBalanceUnderflow = 35,
+    // ── Post / profile ────────────────────────────────────────────────────────
     PostNotFound = 36,
     UsernameTooShort = 37,
     UsernameTooLong = 38,
@@ -79,19 +93,50 @@ pub enum ContractError {
     ContentTooLong = 42,
     TreasuryCannotBeContract = 43,
     NoOpFeeUpdate = 44,
-    InvalidWasmHash = 43,
+    // ── Reward / asset ────────────────────────────────────────────────────────
+    InvalidRewardAsset = 45,
+    RewardFundsReserved = 46,
+    RewardFundsUnavailable = 47,
+    // ── Verifier / stake (CT-022) ─────────────────────────────────────────────
+    VerifierAlreadyRegistered = 54,
+    VerifierNotRegistered = 55,
+    StakeAmountMustBePositive = 56,
+    // CT-022: StakeBalanceOverflow fires on deposit_stake checked_add failure.
+    StakeBalanceOverflow = 57,
+    MinimumVerifierStakeMustBePositive = 58,
+    InsufficientVerifierStake = 59,
+    // ── Contract state ────────────────────────────────────────────────────────
+    Paused = 60,
+    InvalidWasmHash = 61,
+    CannotLikeOwnPost = 62,
+    // ── Vote round ────────────────────────────────────────────────────────────
+    RoundAlreadyExists = 63,
+    RoundNotFound = 64,
+    RoundClosed = 65,
+    RoundAlreadyFinalized = 66,
+    AlreadyVoted = 67,
+    RoundStillOpen = 68,
 }
 
 // ── Instance-storage key constants (small scalars, not contracttype) ──────────
 
 const POST_CT: Symbol = symbol_short!("POST_CT");
 const PROFILE_CREATED_CT: Symbol = symbol_short!("PROF_CT");
-const ADMIN: Symbol = symbol_short!("ADMIN");
+pub(crate) const ADMIN: Symbol = symbol_short!("ADMIN");
 const TREASURY: Symbol = symbol_short!("TREASURY");
 const FEE_BPS: Symbol = symbol_short!("FEE_BPS");
 const INITIALIZED: Symbol = symbol_short!("INIT");
 const TIP_COOLDOWN_WINDOW: Symbol = symbol_short!("TIP_CD_W");
+const PRICE_SCALE: i128 = 100;
+const PRICE_MAX: i128 = 9_000_000_000_000_000_000;
+const PRICE_SUBMISSION_GAP: u32 = 1_728;
+const PRICE_MIN_STAKE: i128 = 1;
+const PRICE_DEPOSIT: i128 = 1;
+const PRICE_EVENT_VERSION: Symbol = symbol_short!("v1");
 const PROPOSAL_CT: Symbol = symbol_short!("PROP_CT");
+pub(crate) const MIN_VERIFIER_STAKE: Symbol = symbol_short!("MIN_V_STK");
+pub(crate) const VERIFIER_COUNT: Symbol = symbol_short!("VFR_CNT");
+const PAUSED: Symbol = symbol_short!("PAUSED");
 
 // ── TTL Constants ─────────────────────────────────────────────────────────────
 //
@@ -151,6 +196,15 @@ pub struct Pool {
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewardAssetConfig {
+    /// Stellar XLM asset identifier for the active network.
+    pub xlm: Address,
+    /// Stellar USDC asset identifier for the active network.
+    pub usdc: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProposalStatus {
     Pending,
     Executed,
@@ -166,6 +220,13 @@ pub struct Proposal {
     pub recipient: Address,
     pub signers: Vec<Address>,
     pub status: ProposalStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuorumConfig {
+    pub min_quorum_size: u32,
+    pub approval_threshold_percent: u32,
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────
@@ -222,6 +283,21 @@ pub struct PostCreatedEvent {
     pub id: u64,
     #[topic]
     pub author: Address,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct PriceSubmittedEvent {
+    #[topic]
+    pub version: Symbol,
+    #[topic]
+    pub submitter: Address,
+    #[topic]
+    pub item: String,
+    pub amount: i128,
+    pub asset: Address,
+    pub period: u64,
+    pub timestamp: u64,
 }
 
 #[contractevent]
@@ -364,6 +440,28 @@ pub struct TreasuryUpdatedEvent {
     pub old_treasury: Address,
     pub new_treasury: Address,
 }
+
+#[contractevent]
+#[derive(Clone)]
+pub struct PauseEvent {
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct UnpauseEvent {
+    pub admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone)]
+pub struct QuorumConfigUpdatedEvent {
+    #[topic]
+    pub name: Symbol,
+    pub min_quorum_size: u32,
+    pub approval_threshold_percent: u32,
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -526,7 +624,7 @@ impl KovaraContract {
             &Profile {
                 address: user.clone(),
                 username: username.clone(),
-                creator_token,
+                creator_token: creator_token.clone(),
             },
         );
         env.storage().persistent().set(&username_index_key, &user);
@@ -895,6 +993,11 @@ impl KovaraContract {
             .unwrap_or_else(|| {
                 panic_with_error!(&env, ContractError::PostNotFound);
             });
+
+        if post.author == user {
+            panic_with_error!(&env, ContractError::CannotLikeOwnPost);
+        }
+
         post.like_count += 1;
         env.storage().persistent().set(&post_key, &post);
         Self::bump(&env, &post_key);
@@ -931,6 +1034,7 @@ impl KovaraContract {
     /// - `TipCooldownNotExpired` if a tip was made within the cooldown window.
     /// - `TreasuryNotSet` if the treasury address has not been configured.
     pub fn tip(env: Env, tipper: Address, post_id: u64, token: Address, amount: i128) {
+        Self::require_not_paused(&env);
         Self::require_initialized(&env);
         Self::bump_instance(&env);
         if amount <= 0 {
@@ -1021,6 +1125,60 @@ impl KovaraContract {
         .publish(&env);
     }
 
+    // ── Price observations ─────────────────────────────────────────────────────
+
+    /// Submit a price as integer minor units scaled by 100 (two decimal places).
+    /// Each contributor may submit one observation per item and period.
+    pub fn submit_price(
+        env: Env,
+        submitter: Address,
+        item: String,
+        amount: i128,
+        asset: Address,
+        period: u64,
+        stake: i128,
+    ) {
+        Self::bump_instance(&env);
+        submitter.require_auth();
+        assert!(!item.is_empty(), "item is required");
+        assert!(amount > 0 && amount <= PRICE_MAX, "price out of range");
+        assert!(stake >= PRICE_MIN_STAKE, "insufficient stake");
+        assert!(period <= env.ledger().timestamp(), "period is in the future");
+
+        let observation_key = StorageKey::PriceObservation(submitter.clone(), item.clone(), period);
+        assert!(!env.storage().persistent().has(&observation_key), "duplicate observation");
+        if let Some(last) = env.storage().persistent().get::<_, u32>(&StorageKey::PriceRate(submitter.clone())) {
+            assert!(env.ledger().sequence().saturating_sub(last) >= PRICE_SUBMISSION_GAP, "submission rate limited");
+        }
+
+        let stake_key = StorageKey::PriceStake(submitter.clone());
+        let current_stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0);
+        let token_client = token::Client::new(&env, &asset);
+        token_client.transfer(&submitter, &env.current_contract_address(), &stake);
+        token_client.transfer(&submitter, &env.current_contract_address(), &PRICE_DEPOSIT);
+        // CT-022: use checked_add so a price-stake overflow produces a named
+        // StakeBalanceOverflow error rather than a generic host trap.
+        let new_stake = current_stake
+            .checked_add(stake)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeBalanceOverflow));
+        env.storage().persistent().set(&stake_key, &new_stake);
+        env.storage().persistent().set(&observation_key, &amount);
+        env.storage().persistent().set(&StorageKey::PriceRate(submitter.clone()), &env.ledger().sequence());
+        Self::bump(&env, &stake_key);
+        Self::bump(&env, &observation_key);
+        Self::bump(&env, &StorageKey::PriceRate(submitter.clone()));
+        PriceSubmittedEvent { version: PRICE_EVENT_VERSION, submitter, item, amount, asset, period, timestamp: env.ledger().timestamp() }.publish(&env);
+    }
+
+    pub fn get_price(env: Env, submitter: Address, item: String, period: u64) -> Option<i128> {
+        let key = StorageKey::PriceObservation(submitter, item, period);
+        let result = env.storage().persistent().get(&key);
+        if result.is_some() { Self::bump(&env, &key); }
+        result
+    }
+
+    pub fn price_scale(_env: Env) -> i128 { PRICE_SCALE }
+
     // ── Community Pool ────────────────────────────────────────────────────────
 
     /// Create a named community pool identified by `pool_id`. The pool holds a
@@ -1080,6 +1238,7 @@ impl KovaraContract {
         token: Address,
         amount: i128,
     ) {
+        Self::require_not_paused(&env);
         Self::require_initialized(&env);
         Self::bump_instance(&env);
         if amount <= 0 {
@@ -1125,6 +1284,7 @@ impl KovaraContract {
         amount: i128,
         recipient: Address,
     ) {
+        Self::require_not_paused(&env);
         Self::require_initialized(&env);
         Self::bump_instance(&env);
         if amount <= 0 {
@@ -1453,6 +1613,7 @@ impl KovaraContract {
     /// unique signers reaches the pool threshold the proposal is executed
     /// automatically and funds are transferred to `recipient`.
     pub fn sign_proposal(env: Env, signer: Address, proposal_id: u64) {
+        Self::require_not_paused(&env);
         Self::require_initialized(&env);
         Self::bump_instance(&env);
         signer.require_auth();
@@ -1683,7 +1844,96 @@ impl KovaraContract {
             .instance()
             .extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
     }
+
+    pub fn pause(env: Env) {
+        Self::require_initialized(&env);
+        Self::bump_instance(&env);
+        Self::require_admin(&env);
+        env.storage().instance().set(&PAUSED, &true);
+        let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
+        PauseEvent { admin }.publish(&env);
+    }
+
+    pub fn unpause(env: Env) {
+        Self::require_initialized(&env);
+        Self::bump_instance(&env);
+        Self::require_admin(&env);
+        env.storage().instance().set(&PAUSED, &false);
+        let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
+        UnpauseEvent { admin }.publish(&env);
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        Self::require_initialized(&env);
+        env.storage().instance().get(&PAUSED).unwrap_or(false)
+    }
+
+    // ── Quorum Configuration ──────────────────────────────────────────────────
+
+    /// Set the quorum configuration parameters. Admin-only.
+    ///
+    /// `min_quorum_size` must be > 0 and `approval_threshold_percent` must be
+    /// > 0 and <= 100. Emits a `QuorumConfigUpdatedEvent`.
+    ///
+    /// # Panics
+    /// - `InvalidThreshold` if either parameter is out of range.
+    pub fn set_quorum_config(
+        env: Env,
+        min_quorum_size: u32,
+        approval_threshold_percent: u32,
+    ) {
+        Self::require_initialized(&env);
+        Self::bump_instance(&env);
+        Self::require_admin(&env);
+
+        if min_quorum_size == 0 {
+            panic_with_error!(&env, ContractError::InvalidThreshold);
+        }
+        if approval_threshold_percent == 0 || approval_threshold_percent > 100 {
+            panic_with_error!(&env, ContractError::InvalidThreshold);
+        }
+
+        let config = QuorumConfig {
+            min_quorum_size,
+            approval_threshold_percent,
+        };
+
+        env.storage()
+            .instance()
+            .set(&StorageKey::QuorumConfig, &config);
+
+        QuorumConfigUpdatedEvent {
+            name: symbol_short!("quorum"),
+            min_quorum_size,
+            approval_threshold_percent,
+        }
+        .publish(&env);
+    }
+
+    /// Return the current quorum configuration, or a default (1, 51) if none
+    /// has been set.
+    pub fn get_quorum_config(env: Env) -> QuorumConfig {
+        Self::require_initialized(&env);
+        env.storage()
+            .instance()
+            .get(&StorageKey::QuorumConfig)
+            .unwrap_or(QuorumConfig {
+                min_quorum_size: 1,
+                approval_threshold_percent: 51,
+            })
+    }
+
+    pub(crate) fn require_not_paused(env: &Env) {
+        if env.storage().instance().get(&PAUSED).unwrap_or(false) {
+            panic_with_error!(env, ContractError::Paused);
+        }
+    }
 }
 
+#[cfg(test)]
 mod test;
 pub mod flow_rewards;
+pub mod sentinel_pool;
+
+#[cfg(test)]
+mod sentinel_pool_test;
